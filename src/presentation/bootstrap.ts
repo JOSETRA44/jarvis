@@ -3,11 +3,10 @@ import { getDb, runMigrations } from '../infrastructure/database/client.js';
 import { OperatorRepo } from '../infrastructure/database/OperatorRepo.js';
 import { SessionRepo } from '../infrastructure/database/SessionRepo.js';
 import { CommandRepo } from '../infrastructure/database/CommandRepo.js';
-import { SpawnExecutor } from '../infrastructure/terminal/SpawnExecutor.js';
+import { SessionManager } from '../infrastructure/terminal/SessionManager.js';
 import { WhatsAppAdapter } from '../infrastructure/messengers/WhatsAppAdapter.js';
 import { TelegramAdapter } from '../infrastructure/messengers/TelegramAdapter.js';
 import { AuthorizeOperatorUseCase } from '../application/AuthorizeOperator/AuthorizeOperatorUseCase.js';
-import { ExecuteCommandUseCase } from '../application/ExecuteCommand/ExecuteCommandUseCase.js';
 import { RouteMessageUseCase } from '../application/RouteMessage/RouteMessageUseCase.js';
 import { RateLimiter } from '../infrastructure/security/RateLimiter.js';
 import { ModeManager } from '../infrastructure/config/ModeManager.js';
@@ -28,17 +27,12 @@ export async function bootstrap() {
   const sessionRepo = new SessionRepo(db);
   const commandRepo = new CommandRepo(db);
 
-  const executor = new SpawnExecutor();
+  // One persistent shell per operator (stateful: cd persists between commands)
+  const sessionMgr = new SessionManager(config.DEFAULT_CWD);
   const rateLimiter = new RateLimiter(config.RATE_LIMIT_PER_MINUTE);
   const modeManager = new ModeManager(config.INITIAL_MODE);
 
   const authorizeUC = new AuthorizeOperatorUseCase(operatorRepo);
-  const executeUC = new ExecuteCommandUseCase(
-    executor,
-    commandRepo,
-    sessionRepo,
-    config.COMMAND_TIMEOUT_SECONDS * 1000
-  );
 
   const latestQR: { dataUrl: string | null } = { dataUrl: null };
   const adapters: (WhatsAppAdapter | TelegramAdapter)[] = [];
@@ -60,10 +54,10 @@ export async function bootstrap() {
 
   const routeUC = new RouteMessageUseCase(
     authorizeUC,
-    executeUC,
+    sessionMgr,
+    commandRepo,
     sessionRepo,
     rateLimiter,
-    () => modeManager.get(),
     broadcastOutput
   );
 
@@ -88,12 +82,15 @@ export async function bootstrap() {
   await app.listen({ port: config.DASHBOARD_PORT, host: '0.0.0.0' });
   console.log(`\n🚀 JARVIS Dashboard: http://localhost:${config.DASHBOARD_PORT}`);
 
-  // Conectar bots después de que el servidor esté listo
   for (const adapter of adapters) {
     adapter.connect().catch((err) => {
       console.error(`[${adapter.platform}] Error al conectar:`, err);
     });
   }
 
-  return { app, adapters, modeManager };
+  // Clean up shells on exit
+  process.on('SIGINT', () => { sessionMgr.killAll(); process.exit(0); });
+  process.on('SIGTERM', () => { sessionMgr.killAll(); process.exit(0); });
+
+  return { app, adapters, modeManager, sessionMgr };
 }

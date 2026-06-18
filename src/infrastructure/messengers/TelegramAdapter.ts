@@ -4,6 +4,22 @@ import type { IMessengerAdapter, IncomingMessage, MessengerStatus } from '../../
 type MessageHandler = (msg: IncomingMessage) => Promise<void>;
 type StatusHandler = (status: MessengerStatus) => void;
 
+// Commands registered in Telegram's / menu for discoverability.
+// Users can type /cd, /dir, /git etc. — they are forwarded to the shell.
+const TELEGRAM_COMMANDS = [
+  { command: 'help',   description: 'Mostrar ayuda completa' },
+  { command: 'pwd',    description: 'Ver directorio actual' },
+  { command: 'reset',  description: 'Reiniciar shell desde el directorio inicial' },
+  { command: 'status', description: 'Ver sesiones de shell activas' },
+  { command: 'cd',     description: 'Cambiar directorio · ej: /cd source\\proyecto' },
+  { command: 'dir',    description: 'Listar archivos del directorio actual' },
+  { command: 'ls',     description: 'Listar archivos (alias de dir)' },
+  { command: 'git',    description: 'Ejecutar git · ej: /git status' },
+  { command: 'npm',    description: 'Ejecutar npm · ej: /npm run dev' },
+  { command: 'gemini', description: 'Lanzar Gemini CLI · ej: /gemini "explica esto"' },
+  { command: 'claude', description: 'Lanzar Claude CLI · ej: /claude "revisa esto"' },
+];
+
 export class TelegramAdapter implements IMessengerAdapter {
   readonly platform = 'telegram' as const;
 
@@ -40,6 +56,12 @@ export class TelegramAdapter implements IMessengerAdapter {
     });
 
     const me = await this.bot.api.getMe();
+
+    // Register bot commands so they appear in the / autocomplete menu
+    await this.bot.api.setMyCommands(TELEGRAM_COMMANDS).catch((err) => {
+      console.warn('[Telegram] No se pudo registrar comandos:', err.message);
+    });
+
     this.currentStatus = {
       platform: 'telegram',
       status: 'connected',
