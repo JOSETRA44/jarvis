@@ -1,0 +1,14 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "tables": {
+    "operators": { "name": "operators", "columns": {}, "indexes": {}, "foreignKeys": {}, "compositePrimaryKeys": {}, "uniqueConstraints": {} },
+    "sessions": { "name": "sessions", "columns": {}, "indexes": {}, "foreignKeys": {}, "compositePrimaryKeys": {}, "uniqueConstraints": {} },
+    "commands": { "name": "commands", "columns": {}, "indexes": {}, "foreignKeys": {}, "compositePrimaryKeys": {}, "uniqueConstraints": {} },
+    "config": { "name": "config", "columns": {}, "indexes": {}, "foreignKeys": {}, "compositePrimaryKeys": {}, "uniqueConstraints": {} }
+  },
+  "enums": {},
+  "_meta": { "schemas": {}, "tables": {}, "columns": {} },
+  "id": "00000000-0000-0000-0000-000000000000",
+  "prevId": "00000000-0000-0000-0000-000000000000"
+}
