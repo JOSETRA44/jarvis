@@ -13,6 +13,7 @@ import { RateLimiter } from '../infrastructure/security/RateLimiter.js';
 import { ModeManager } from '../infrastructure/config/ModeManager.js';
 import { buildServer } from './api/server.js';
 import { registerTerminalWS, broadcastOutput, broadcastQR, broadcastBotStatus } from './ws/terminal.ws.js';
+import { registerMobileWS } from './ws/mobile.ws.js';
 import { authRoutes } from './api/routes/auth.js';
 import { operatorRoutes } from './api/routes/operators.js';
 import { commandRoutes } from './api/routes/commands.js';
@@ -76,6 +77,7 @@ export async function bootstrap() {
 
   const app = await buildServer(config);
   registerTerminalWS(app);
+  registerMobileWS(app, sessionMgr);
 
   await authRoutes(app, config.DASHBOARD_PASSWORD);
   await operatorRoutes(app, operatorRepo);
