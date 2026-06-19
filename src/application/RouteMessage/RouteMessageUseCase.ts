@@ -6,7 +6,7 @@ import type { RateLimiter } from '../../infrastructure/security/RateLimiter.js';
 import type { ISessionRepository } from '../../domain/ports/ISessionRepository.js';
 
 const MAX_MSG_CHARS = 3800;
-const LIVE_FRAME_MAX = 2800;
+const LIVE_FRAME_MAX = 3000; // max chars of VirtualScreen snapshot shown in Telegram frame
 
 // ── Inline keyboards ──────────────────────────────────────────────────────────
 
@@ -56,10 +56,20 @@ function normalizeShellCommand(text: string): string {
   return text;
 }
 
+/** True when the last line of the snapshot looks like a prompt waiting for input */
+function seemsWaitingForInput(snapshot: string): boolean {
+  const lastLine = snapshot.split('\n').filter((l) => l.trim()).pop() ?? '';
+  return /[>$#%:?]\s*$/.test(lastLine.trim()) || /[❯▶]\s*$/.test(lastLine);
+}
+
 function buildFrameText(header: string, content: string, statusLine: string | null): string {
   const parts = [header];
   const trimmed = content.trim();
-  if (trimmed) parts.push('```\n' + truncate(trimmed, LIVE_FRAME_MAX) + '\n```');
+  if (trimmed) {
+    const cap = truncate(trimmed, LIVE_FRAME_MAX);
+    const waiting = !statusLine && seemsWaitingForInput(trimmed);
+    parts.push('```\n' + cap + (waiting ? '\n▋' : '') + '\n```');
+  }
   if (statusLine) parts.push(statusLine);
   return parts.join('\n');
 }
@@ -304,33 +314,31 @@ export class RouteMessageUseCase {
       );
     }
 
-    // WhatsApp debounced output accumulator
-    let waOutput = '';
+    // PtyProcess delivers full VirtualScreen snapshots (not raw chunks).
+    // For Telegram we replace frame.content on each snapshot.
+    // For WhatsApp we keep only the latest snapshot and send it debounced.
+    let waSnapshot = '';
     let waTimer: NodeJS.Timeout | null = null;
 
-    const proc = this.sessionMgr.startInteractive(operatorId, cmd, cwd, (chunk) => {
-      this.onOutput?.(operatorId, chunk);
+    const proc = this.sessionMgr.startInteractive(operatorId, cmd, cwd, (snapshot) => {
+      this.onOutput?.(operatorId, snapshot);
 
       const frame = this.liveFrames.get(operatorId);
       if (frame) {
-        // Telegram: update the live frame message in-place
-        frame.content += chunk;
-        if (frame.content.length > LIVE_FRAME_MAX + 200) {
-          frame.content = '[...]\n' + frame.content.slice(-LIVE_FRAME_MAX);
-        }
+        // Telegram: REPLACE content with the current rendered screen state
+        frame.content = snapshot;
         if (frame.timer) clearTimeout(frame.timer);
         frame.timer = setTimeout(() => {
           const frameText = buildFrameText(frame.header, frame.content, null);
           adapter.editMessage?.(from, frame.messageId, frameText, CONTROL_KEYBOARD).catch(() => {});
         }, 500);
       } else if (!usingLiveFrame) {
-        // WhatsApp / fallback: debounced sendText
-        waOutput += chunk;
+        // WhatsApp / fallback: keep latest snapshot, send debounced
+        waSnapshot = snapshot;
         if (waTimer) clearTimeout(waTimer);
         waTimer = setTimeout(async () => {
-          if (waOutput.trim()) {
-            await adapter.sendText(from, '```\n' + truncate(waOutput.trim()) + '\n```').catch(() => {});
-            waOutput = '';
+          if (waSnapshot.trim()) {
+            await adapter.sendText(from, '```\n' + truncate(waSnapshot.trim()) + '\n```').catch(() => {});
           }
         }, 800);
       }
@@ -344,10 +352,10 @@ export class RouteMessageUseCase {
         return;
       }
 
-      // Drain any pending WA output
+      // Drain any pending WA snapshot
       if (waTimer) clearTimeout(waTimer);
-      if (waOutput.trim() && !usingLiveFrame) {
-        await adapter.sendText(from, '```\n' + truncate(waOutput.trim()) + '\n```').catch(() => {});
+      if (waSnapshot.trim() && !usingLiveFrame) {
+        await adapter.sendText(from, '```\n' + truncate(waSnapshot.trim()) + '\n```').catch(() => {});
       }
 
       const frame = this.liveFrames.get(operatorId);

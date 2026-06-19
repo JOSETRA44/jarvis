@@ -1,17 +1,17 @@
 import { ShellSession } from './ShellSession.js';
-import { InteractiveProcess } from './InteractiveProcess.js';
+import { PtyProcess } from './PtyProcess.js';
 
 /**
  * One persistent ShellSession per operator (for stateful non-interactive commands)
- * plus one optional InteractiveProcess per operator (for REPLs, AI CLIs, etc.).
+ * plus one optional PtyProcess per operator (for REPLs, AI CLIs, TUI apps).
  *
- * The two are separate because:
- * - ShellSession (PS wrapper): great for cd/dir/git with CWD persistence
- * - InteractiveProcess: direct spawn with real stdin pipe for live I/O
+ * - ShellSession (PS wrapper): great for cd/dir/git with CWD persistence, isTTY not required
+ * - PtyProcess (ConPTY): spawns with a real PTY so tools like gemini/claude/qwen
+ *   see isTTY=true and enter interactive/chat mode
  */
 export class SessionManager {
   private sessions = new Map<string, ShellSession>();
-  private interactive = new Map<string, InteractiveProcess>();
+  private interactive = new Map<string, PtyProcess>();
   private defaultCwd: string;
 
   constructor(defaultCwd: string) {
@@ -34,14 +34,14 @@ export class SessionManager {
     return session;
   }
 
-  // ── Interactive processes ────────────────────────────────────────
+  // ── PTY interactive processes ────────────────────────────────────
 
   hasInteractive(operatorId: string): boolean {
     const p = this.interactive.get(operatorId);
     return p != null && p.isAlive;
   }
 
-  getInteractive(operatorId: string): InteractiveProcess | undefined {
+  getInteractive(operatorId: string): PtyProcess | undefined {
     const p = this.interactive.get(operatorId);
     return p?.isAlive ? p : undefined;
   }
@@ -50,11 +50,11 @@ export class SessionManager {
     operatorId: string,
     command: string,
     cwd: string,
-    onData: (chunk: string) => void,
-  ): InteractiveProcess {
-    this.killInteractive(operatorId); // clean up any previous
+    onData: (snapshot: string) => void,
+  ): PtyProcess {
+    this.killInteractive(operatorId);
 
-    const proc = new InteractiveProcess(command, cwd, onData);
+    const proc = new PtyProcess(command, cwd, onData);
 
     proc.on('exit', () => {
       if (this.interactive.get(operatorId) === proc) {
