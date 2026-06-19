@@ -1,4 +1,4 @@
-import type { IncomingMessage, IMessengerAdapter } from '../../domain/ports/IMessengerAdapter.js';
+import type { IncomingMessage, IMessengerAdapter, KeyboardButton } from '../../domain/ports/IMessengerAdapter.js';
 import type { AuthorizeOperatorUseCase } from '../AuthorizeOperator/AuthorizeOperatorUseCase.js';
 import type { ICommandRepository } from '../../domain/ports/ICommandRepository.js';
 import type { SessionManager } from '../../infrastructure/terminal/SessionManager.js';
@@ -6,6 +6,33 @@ import type { RateLimiter } from '../../infrastructure/security/RateLimiter.js';
 import type { ISessionRepository } from '../../domain/ports/ISessionRepository.js';
 
 const MAX_MSG_CHARS = 3800;
+const LIVE_FRAME_MAX = 2800;
+
+// ── Inline keyboards ──────────────────────────────────────────────────────────
+
+const CONTROL_KEYBOARD: KeyboardButton[][] = [
+  [
+    { text: '⌃C  Kill',  data: 'j:cc' },
+    { text: '⌃D  EOF',   data: 'j:cd' },
+  ],
+  [
+    { text: '↵ Enter',   data: 'j:en' },
+    { text: 'Esc',       data: 'j:es' },
+  ],
+  [
+    { text: '🔙 Salir',  data: 'j:ex' },
+  ],
+];
+
+const NAV_KEYBOARD: KeyboardButton[][] = [
+  [
+    { text: '📄 dir',    data: 'j:nav:dir' },
+    { text: '⬆ ..',     data: 'j:nav:..' },
+    { text: '🏠 inicio', data: 'j:nav:home' },
+  ],
+];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function truncate(text: string, max = MAX_MSG_CHARS): string {
   if (text.length <= max) return text;
@@ -21,14 +48,7 @@ function formatResult(cmd: string, output: string, exitCode: number, cwd: string
   return `${header}\n${cwdLine}\n\`\`\`\n${truncate(output)}\n\`\`\`\n${timeLine}`;
 }
 
-/**
- * Strip a leading / or \ from commands that are NOT JARVIS built-ins.
- *
- * Telegram users naturally type /cd source, /dir, /git status because the /
- * prefix triggers the bot command menu. WhatsApp users sometimes type \cd too.
- * Built-in JARVIS commands (/help, /pwd, /reset, /status) are handled before
- * this function is ever called and are never normalized.
- */
+/** Strip a leading / or \ from shell commands that are NOT JARVIS built-ins. */
 function normalizeShellCommand(text: string): string {
   if ((text.startsWith('/') || text.startsWith('\\')) && text.length > 1) {
     return text.slice(1).trimStart();
@@ -36,7 +56,35 @@ function normalizeShellCommand(text: string): string {
   return text;
 }
 
+function buildFrameText(header: string, content: string, statusLine: string | null): string {
+  const parts = [header];
+  const trimmed = content.trim();
+  if (trimmed) parts.push('```\n' + truncate(trimmed, LIVE_FRAME_MAX) + '\n```');
+  if (statusLine) parts.push(statusLine);
+  return parts.join('\n');
+}
+
+// ── Live frame type ───────────────────────────────────────────────────────────
+
+interface LiveFrame {
+  messageId: string;
+  header: string;
+  content: string;
+  timer: NodeJS.Timeout | null;
+}
+
+// ── Use case ──────────────────────────────────────────────────────────────────
+
 export class RouteMessageUseCase {
+  /** Per-operator Telegram live frame state */
+  private liveFrames = new Map<string, LiveFrame>();
+
+  /**
+   * Tracks operators whose interactive process was intentionally killed
+   * so the exit handler doesn't send a redundant "Proceso terminado" message.
+   */
+  private killedByUser = new Set<string>();
+
   constructor(
     private authorizeUC: AuthorizeOperatorUseCase,
     private sessionMgr: SessionManager,
@@ -46,11 +94,41 @@ export class RouteMessageUseCase {
     private onOutput?: (operatorId: string, chunk: string) => void
   ) {}
 
+  // ── Callback query entry point ─────────────────────────────────────────────
+
+  async handleCallback(queryId: string, from: string, data: string, adapter: IMessengerAdapter): Promise<void> {
+    // Always dismiss the loading spinner promptly (Telegram requires answer within 30s)
+    await adapter.answerCallback?.(queryId);
+
+    if (!data.startsWith('j:')) return;
+
+    const operator = await this.authorizeUC.execute(adapter.platform, from);
+    if (!operator) return;
+
+    const code = data.slice(2); // e.g. "cc", "ex", "nav:.."
+
+    if (code.startsWith('nav:')) {
+      await this.handleNavCallback(code.slice(4), operator.id, from, adapter);
+      return;
+    }
+
+    const proc = this.sessionMgr.getInteractive(operator.id);
+
+    switch (code) {
+      case 'cc': proc?.writeRaw('\x03'); break;  // Ctrl+C
+      case 'cd': proc?.writeRaw('\x04'); break;  // Ctrl+D
+      case 'en': proc?.writeLine('');    break;  // Enter
+      case 'es': proc?.writeRaw('\x1b'); break;  // Escape
+      case 'ex': await this.exitInteractiveMode(operator.id, from, adapter); break;
+    }
+  }
+
+  // ── Message entry point ────────────────────────────────────────────────────
+
   async handle(msg: IncomingMessage, adapter: IMessengerAdapter): Promise<void> {
     const text = msg.text.trim();
     if (!text) return;
 
-    // ── Authorization ──────────────────────────────────────────────
     const operator = await this.authorizeUC.execute(msg.platform, msg.from);
     if (!operator) {
       await adapter.sendText(
@@ -62,21 +140,14 @@ export class RouteMessageUseCase {
       return;
     }
 
-    const shell = this.sessionMgr.get(operator.id);
-
-    // ── Interactive passthrough mode ───────────────────────────────
-    if (shell.interactiveMode) {
-      if (text === '!exit' || text === '/exit' || text.toLowerCase() === 'exit') {
-        shell.exitInteractive();
-        await adapter.sendText(msg.from, '🔙 Saliste del modo interactivo. Shell normal restaurado.');
-        return;
-      }
-      shell.sendRaw(text);
+    // ── Interactive passthrough ────────────────────────────────────────
+    if (this.sessionMgr.hasInteractive(operator.id)) {
+      await this.handleInteractiveInput(text, operator.id, msg.from, adapter);
       return;
     }
 
-    // ── Built-in JARVIS commands ────────────────────────────────────
-    // These are checked BEFORE normalization so /help, /pwd etc. keep working.
+    // ── Built-in JARVIS commands ───────────────────────────────────────
+    // Checked BEFORE normalization so /help, /pwd etc. don't reach the shell.
     if (text === '/help' || text === '?' || text === '/ayuda' || text === 'help') {
       await adapter.sendText(msg.from, helpText(msg.platform));
       return;
@@ -90,6 +161,7 @@ export class RouteMessageUseCase {
     }
 
     if (text === '/pwd' || text === '/cwd') {
+      const shell = this.sessionMgr.get(operator.id);
       await adapter.sendText(msg.from, `📂 *Directorio actual:*\n\`${shell.cwd}\``);
       return;
     }
@@ -103,47 +175,27 @@ export class RouteMessageUseCase {
       return;
     }
 
-    // ── Normalize: strip leading / or \ before reaching the shell ──
-    // After this point, /cd source → cd source, \git status → git status, etc.
+    // ── Normalize: strip leading / or \ before reaching the shell ─────
     const shellText = normalizeShellCommand(text);
 
-    // ── Interactive mode trigger: ! prefix ─────────────────────────
+    // ── Interactive mode trigger: ! prefix ─────────────────────────────
     if (shellText.startsWith('!') && shellText.length > 1) {
       const cmd = shellText.slice(1).trim();
-      await adapter.sendText(
-        msg.from,
-        `🔀 *Modo interactivo:* \`${cmd}\`\n` +
-        `Tus próximos mensajes van directo al proceso.\n` +
-        `Escribe \`!exit\` o \`/exit\` para terminar.`
-      );
-
-      let outputAccum = '';
-      let sendTimer: NodeJS.Timeout | null = null;
-
-      shell.enterInteractive((chunk) => {
-        outputAccum += chunk;
-        this.onOutput?.(operator.id, chunk);
-        if (sendTimer) clearTimeout(sendTimer);
-        sendTimer = setTimeout(async () => {
-          if (outputAccum.trim()) {
-            await adapter.sendText(msg.from, '```\n' + truncate(outputAccum.trim()) + '\n```').catch(() => {});
-            outputAccum = '';
-          }
-        }, 800);
-      });
-
-      shell.sendRaw(cmd);
-      return;
+      if (cmd) {
+        await this.startInteractiveMode(operator.id, cmd, msg.from, adapter);
+        return;
+      }
     }
 
-    // ── Rate limiting ──────────────────────────────────────────────
+    // ── Rate limiting ──────────────────────────────────────────────────
     if (this.rateLimiter.isLimited(operator.id)) {
       await adapter.sendText(msg.from, '⏳ Demasiados comandos. Espera un momento.');
       return;
     }
     this.rateLimiter.record(operator.id);
 
-    // ── Execute in persistent shell ────────────────────────────────
+    // ── Execute in persistent shell ────────────────────────────────────
+    const shell = this.sessionMgr.get(operator.id);
     await adapter.sendText(msg.from, `⚙️ Ejecutando en \`${shell.cwd}\`…`);
 
     let or = await this.sessionRepo.findActiveByOperator(operator.id);
@@ -174,14 +226,194 @@ export class RouteMessageUseCase {
         durationMs: result.durationMs,
       });
 
-      await adapter.sendText(msg.from, formatResult(shellText, result.output, result.exitCode, result.cwd, result.durationMs));
+      const resultText = formatResult(shellText, result.output, result.exitCode, result.cwd, result.durationMs);
+
+      // Show navigation keyboard after a successful cd (Telegram only)
+      const isCd = /^\s*(?:cd|chdir)(?:\s|$)/i.test(shellText);
+      if (isCd && result.exitCode === 0 && adapter.sendWithKeyboard) {
+        await adapter.sendWithKeyboard(msg.from, resultText, NAV_KEYBOARD);
+      } else {
+        await adapter.sendText(msg.from, resultText);
+      }
     } catch (err) {
       await adapter.sendText(msg.from, `❌ Error: ${(err as Error).message}`);
     }
   }
+
+  // ── Interactive mode helpers ───────────────────────────────────────────────
+
+  private async handleInteractiveInput(
+    text: string,
+    operatorId: string,
+    from: string,
+    adapter: IMessengerAdapter,
+  ): Promise<void> {
+    const proc = this.sessionMgr.getInteractive(operatorId);
+
+    if (text === '!exit' || text === '/exit' || text.toLowerCase() === 'exit') {
+      await this.exitInteractiveMode(operatorId, from, adapter);
+      return;
+    }
+
+    // Text-based control signal shortcuts
+    if (text === '!c' || text === '/ctrlc') { proc?.writeRaw('\x03'); return; }
+    if (text === '!d' || text === '/ctrld') { proc?.writeRaw('\x04'); return; }
+    if (text === '/esc')   { proc?.writeRaw('\x1b'); return; }
+    if (text === '/enter') { proc?.writeLine('');    return; }
+
+    proc?.writeLine(text);
+  }
+
+  private async startInteractiveMode(
+    operatorId: string,
+    cmd: string,
+    from: string,
+    adapter: IMessengerAdapter,
+  ): Promise<void> {
+    const shell = this.sessionMgr.get(operatorId);
+    const cwd = shell.cwd;
+    const header = `🔀 \`${cmd}\` | 📂 \`${cwd}\``;
+
+    // Send initial frame (Telegram) or simple text (WhatsApp / others)
+    let usingLiveFrame = false;
+    if (adapter.sendWithKeyboard) {
+      try {
+        const handle = await adapter.sendWithKeyboard(
+          from,
+          `${header}\n_Iniciando proceso..._`,
+          CONTROL_KEYBOARD,
+        );
+        this.liveFrames.set(operatorId, {
+          messageId: handle.messageId,
+          header,
+          content: '',
+          timer: null,
+        });
+        usingLiveFrame = true;
+      } catch (err) {
+        console.error('[Interactive] sendWithKeyboard failed:', err);
+      }
+    }
+
+    if (!usingLiveFrame) {
+      await adapter.sendText(
+        from,
+        `🔀 *Modo interactivo:* \`${cmd}\`\n` +
+        `Tus mensajes van directo al proceso.\n` +
+        `Escribe \`!exit\` o \`/exit\` para terminar.`,
+      );
+    }
+
+    // WhatsApp debounced output accumulator
+    let waOutput = '';
+    let waTimer: NodeJS.Timeout | null = null;
+
+    const proc = this.sessionMgr.startInteractive(operatorId, cmd, cwd, (chunk) => {
+      this.onOutput?.(operatorId, chunk);
+
+      const frame = this.liveFrames.get(operatorId);
+      if (frame) {
+        // Telegram: update the live frame message in-place
+        frame.content += chunk;
+        if (frame.content.length > LIVE_FRAME_MAX + 200) {
+          frame.content = '[...]\n' + frame.content.slice(-LIVE_FRAME_MAX);
+        }
+        if (frame.timer) clearTimeout(frame.timer);
+        frame.timer = setTimeout(() => {
+          const frameText = buildFrameText(frame.header, frame.content, null);
+          adapter.editMessage?.(from, frame.messageId, frameText, CONTROL_KEYBOARD).catch(() => {});
+        }, 500);
+      } else if (!usingLiveFrame) {
+        // WhatsApp / fallback: debounced sendText
+        waOutput += chunk;
+        if (waTimer) clearTimeout(waTimer);
+        waTimer = setTimeout(async () => {
+          if (waOutput.trim()) {
+            await adapter.sendText(from, '```\n' + truncate(waOutput.trim()) + '\n```').catch(() => {});
+            waOutput = '';
+          }
+        }, 800);
+      }
+    });
+
+    proc.on('exit', async (code: number) => {
+      // If the user manually triggered exit, the exit event is a side-effect of kill()
+      // — don't double-send messaging.
+      if (this.killedByUser.has(operatorId)) {
+        this.killedByUser.delete(operatorId);
+        return;
+      }
+
+      // Drain any pending WA output
+      if (waTimer) clearTimeout(waTimer);
+      if (waOutput.trim() && !usingLiveFrame) {
+        await adapter.sendText(from, '```\n' + truncate(waOutput.trim()) + '\n```').catch(() => {});
+      }
+
+      const frame = this.liveFrames.get(operatorId);
+      if (frame) {
+        if (frame.timer) clearTimeout(frame.timer);
+        this.liveFrames.delete(operatorId);
+        const finalText = buildFrameText(frame.header, frame.content, `✅ Proceso terminado · exit ${code}`);
+        await adapter.editMessage?.(from, frame.messageId, finalText).catch(() => {});
+      } else {
+        await adapter.sendText(from, `✅ Proceso terminado · exit ${code}`).catch(() => {});
+      }
+    });
+  }
+
+  private async exitInteractiveMode(
+    operatorId: string,
+    from: string,
+    adapter: IMessengerAdapter,
+  ): Promise<void> {
+    // Mark as user-killed so the proc exit handler doesn't double-send
+    this.killedByUser.add(operatorId);
+
+    const frame = this.liveFrames.get(operatorId);
+    this.sessionMgr.killInteractive(operatorId);
+
+    if (frame) {
+      if (frame.timer) clearTimeout(frame.timer);
+      this.liveFrames.delete(operatorId);
+      const finalText = buildFrameText(frame.header, frame.content, '🔴 Interrumpido por el usuario');
+      await adapter.editMessage?.(from, frame.messageId, finalText).catch(() => {});
+    }
+
+    await adapter.sendText(from, '🔙 Proceso interrumpido. Shell normal restaurado.').catch(() => {});
+  }
+
+  private async handleNavCallback(
+    navArg: string,
+    operatorId: string,
+    from: string,
+    adapter: IMessengerAdapter,
+  ): Promise<void> {
+    const defaultCwd = process.env.DEFAULT_CWD ?? 'C:\\Users\\USER';
+    let navCmd: string;
+
+    if (navArg === '..') navCmd = 'cd ..';
+    else if (navArg === 'home') navCmd = `cd "${defaultCwd}"`;
+    else if (navArg === 'dir') navCmd = 'dir /b';
+    else return;
+
+    const shell = this.sessionMgr.get(operatorId);
+    try {
+      const result = await shell.execute(navCmd, { timeoutMs: 15_000 });
+      const text = formatResult(navCmd, result.output, result.exitCode, result.cwd, result.durationMs);
+      const showNav = navArg !== 'dir' && result.exitCode === 0 && adapter.sendWithKeyboard;
+      if (showNav) {
+        await adapter.sendWithKeyboard!(from, text, NAV_KEYBOARD);
+      } else {
+        await adapter.sendText(from, text);
+      }
+    } catch (err) {
+      await adapter.sendText(from, `❌ ${(err as Error).message}`);
+    }
+  }
 }
 
-// ── Platform-specific help texts ───────────────────────────────────────────
+// ── Platform-specific help texts ───────────────────────────────────────────────
 
 function helpText(platform: 'whatsapp' | 'telegram'): string {
   return platform === 'telegram' ? TELEGRAM_HELP : WHATSAPP_HELP;
@@ -235,10 +467,13 @@ Usa el menú \`/\` o escribe directamente:
 /reset — reiniciar shell
 /status — sesiones activas
 
-*Modo interactivo* (REPLs):
+*Modo interactivo* (REPLs y AI):
 \`!node\` — Node.js REPL
 \`!python\` — Python
 \`!gemini\` — Gemini chat
-\`/exit\` o \`!exit\` — salir del modo
+\`!claude\` — Claude chat
+
+En modo interactivo, botones ⌃C / ⌃D / Enter / Esc / Salir aparecen en el chat.
+También puedes escribir \`!exit\` o \`/exit\` para salir.
 
 _Tu sesión recuerda el directorio entre comandos_ 📂`;

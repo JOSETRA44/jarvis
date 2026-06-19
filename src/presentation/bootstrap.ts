@@ -4,6 +4,7 @@ import { OperatorRepo } from '../infrastructure/database/OperatorRepo.js';
 import { SessionRepo } from '../infrastructure/database/SessionRepo.js';
 import { CommandRepo } from '../infrastructure/database/CommandRepo.js';
 import { SessionManager } from '../infrastructure/terminal/SessionManager.js';
+import type { IMessengerAdapter } from '../domain/ports/IMessengerAdapter.js';
 import { WhatsAppAdapter } from '../infrastructure/messengers/WhatsAppAdapter.js';
 import { TelegramAdapter } from '../infrastructure/messengers/TelegramAdapter.js';
 import { AuthorizeOperatorUseCase } from '../application/AuthorizeOperator/AuthorizeOperatorUseCase.js';
@@ -35,7 +36,7 @@ export async function bootstrap() {
   const authorizeUC = new AuthorizeOperatorUseCase(operatorRepo);
 
   const latestQR: { dataUrl: string | null } = { dataUrl: null };
-  const adapters: (WhatsAppAdapter | TelegramAdapter)[] = [];
+  const adapters: IMessengerAdapter[] = [];
 
   const waAdapter = new WhatsAppAdapter(
     config.WA_AUTH_PATH,
@@ -67,6 +68,9 @@ export async function bootstrap() {
     });
     adapter.onStatusChange((s) => {
       broadcastBotStatus(s.platform, s.status);
+    });
+    adapter.onCallbackQuery?.((queryId, from, data) => {
+      return routeUC.handleCallback(queryId, from, data, adapter);
     });
   }
 
