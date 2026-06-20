@@ -79,7 +79,9 @@ export async function bootstrap() {
   registerTerminalWS(app);
   registerMobileWS(app, sessionMgr);
 
-  await authRoutes(app, config.DASHBOARD_PASSWORD);
+  const allowedDeviceIds = config.ALLOWED_DEVICE_IDS
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  await authRoutes(app, config.DASHBOARD_PASSWORD, allowedDeviceIds);
   await operatorRoutes(app, operatorRepo);
   await commandRoutes(app, commandRepo);
   await botRoutes(app, adapters, latestQR);

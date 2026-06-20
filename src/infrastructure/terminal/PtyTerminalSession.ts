@@ -9,6 +9,10 @@ const STRIP_ANSI = /\x1b\[[\x20-\x3f]*[\x40-\x7e]|\x1b\][^\x07]*\x07|\x1b\][^\x1
 // JARVIS shell-integration marker: ESC ] 9001 ; exitCode ; cwd BEL
 const MARKER_RE = /\x1b\]9001;(-?\d+);([^\x07]*)\x07/g;
 
+// Screen-clear sequences: erase-display (full), alternate-screen enter, cursor-home+erase.
+// Detecting these lets us tell Flutter to clear the running block before the TUI redraws.
+const SCREEN_CLEAR_RE = /\x1b\[2J|\x1b\[H\x1b\[2?J|\x1b\[\?1049h/;
+
 // PowerShell initialization injected into stdin after startup.
 // Sets UTF-8, installs the prompt hook, triggers first prompt.
 const PS_INIT = [
@@ -37,8 +41,12 @@ export class PtyTerminalSession extends EventEmitter {
   private _cwd: string;
   private _proc: pty.IPty;
   private _buf = '';
-  private _ready = false;  // true after first OSC 9001 fires
+  private _ready = false;      // true after first OSC 9001 fires
   private _alive = true;
+  // True when the previous output chunk ended with a bare \r (no \n).
+  // This means the next output should replace the last line in the Flutter UI
+  // instead of appending — handles spinner/progress-bar overwrites.
+  private _lastChunkEndedWithCR = false;
 
   constructor(cwd: string, sessionId?: string) {
     super();
@@ -91,29 +99,63 @@ export class PtyTerminalSession extends EventEmitter {
     }
 
     if (!this._ready) {
-      // Suppress ALL output during init phase (PS startup + init commands echo)
       if (markers.length > 0) {
         this._ready = true;
         const last = markers[markers.length - 1]!;
         if (last.cwd) this._cwd = last.cwd;
-        this.emit('prompt', this._cwd, 0); // shell is ready
+        this.emit('prompt', this._cwd, 0);
       }
       return;
     }
 
-    // Emit cleaned text
-    const clean = chunk
-      .replace(STRIP_ANSI, '')
-      .replace(/\r\n/g, '\n')
-      .replace(/\r/g, '\n');
-
-    if (clean.trimEnd()) {
-      this.emit('output', clean);
+    // ── Raw PTY output for xterm.dart rendering ───────────────────────────────
+    // Send raw bytes minus JARVIS-internal OSC 9001 markers.
+    // Flutter's TerminalView (xterm.dart) handles VT100/cursor movement correctly.
+    const rawForClient = chunk.replace(MARKER_RE, '');
+    if (rawForClient) {
+      this.emit('raw_output', rawForClient);
     }
 
-    // Emit prompt event for each marker found
+    // ── Screen-clear detection (must run on raw chunk before ANSI strip) ──────
+    // When a TUI app clears the screen, tell Flutter to wipe the block output
+    // so the next redraw starts clean instead of appending over old content.
+    if (SCREEN_CLEAR_RE.test(chunk)) {
+      this._lastChunkEndedWithCR = false;
+      this.emit('clear_output');
+    }
+
+    // ── Text cleaning ─────────────────────────────────────────────────────────
+    // 1. Strip ANSI/VT sequences
+    let stripped = chunk.replace(STRIP_ANSI, '');
+
+    // 2. Normalize Windows line endings (\r\n → \n) BEFORE bare-\r handling
+    stripped = stripped.replace(/\r\n/g, '\n');
+
+    // 3. Handle bare \r (carriage return without \n = "go to column 0 and
+    //    overwrite"). Within a single chunk, take only the content after the
+    //    last \r on each \n-terminated line so we show the final frame state.
+    const clean = stripped
+      .split('\n')
+      .map((seg) => seg.includes('\r') ? seg.split('\r').pop()! : seg)
+      .join('\n')
+      .trimEnd();
+
+    // ── Replace-last tracking ─────────────────────────────────────────────────
+    // If the PREVIOUS chunk ended with a bare \r, the current output should
+    // replace the last line already shown in Flutter (spinner frame update).
+    const replaceLast = this._lastChunkEndedWithCR ? 1 : 0;
+
+    // Update state for the next chunk: did this one end with a bare \r?
+    this._lastChunkEndedWithCR = /\r$/.test(stripped);
+
+    if (clean) {
+      this.emit('output', clean, replaceLast);
+    }
+
+    // ── Shell-ready markers ───────────────────────────────────────────────────
     for (const { exitCode, cwd } of markers) {
       if (cwd) this._cwd = cwd;
+      this._lastChunkEndedWithCR = false; // prompt reset — no pending replace
       this.emit('prompt', this._cwd, exitCode);
     }
   }

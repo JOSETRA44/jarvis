@@ -15,6 +15,8 @@ const schema = z.object({
   RATE_LIMIT_PER_MINUTE: z.coerce.number().default(10),
   INITIAL_MODE: z.enum(['ai', 'restricted', 'full-shell']).default('ai'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
+  ALLOWED_DEVICE_IDS: z.string().optional().default(''),
+  CORS_ORIGINS: z.string().optional().default('http://localhost:3000'),
 });
 
 export type Config = z.infer<typeof schema>;

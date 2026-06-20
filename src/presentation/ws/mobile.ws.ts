@@ -144,8 +144,16 @@ function _wireSession(
   sess: PtyTerminalSession,
   sessionMgr: SessionManager,
 ) {
-  sess.on('output', (data: string) => {
-    emit(ws, { type: 'output', data, session: sess.sessionId });
+  sess.on('raw_output', (data: string) => {
+    // Raw PTY bytes (minus JARVIS internal markers) for xterm.dart rendering.
+    // Flutter's TerminalView handles all VT100 cursor/color/overwrite logic.
+    emit(ws, { type: 'raw', data, session: sess.sessionId });
+  });
+  sess.on('output', (data: string, replaceLast: number) => {
+    emit(ws, { type: 'output', data, replace: replaceLast, session: sess.sessionId });
+  });
+  sess.on('clear_output', () => {
+    emit(ws, { type: 'clear_output', session: sess.sessionId });
   });
   sess.on('prompt', (cwd: string, exitCode: number) => {
     emit(ws, { type: 'prompt', cwd, exitCode, session: sess.sessionId });
