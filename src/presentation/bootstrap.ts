@@ -14,11 +14,17 @@ import { ModeManager } from '../infrastructure/config/ModeManager.js';
 import { buildServer } from './api/server.js';
 import { registerTerminalWS, broadcastOutput, broadcastQR, broadcastBotStatus } from './ws/terminal.ws.js';
 import { registerMobileWS } from './ws/mobile.ws.js';
+import { registerPoltergeistWS } from './ws/poltergeist.ws.js';
 import { authRoutes } from './api/routes/auth.js';
 import { operatorRoutes } from './api/routes/operators.js';
 import { commandRoutes } from './api/routes/commands.js';
 import { botRoutes } from './api/routes/bots.js';
 import { configRoutes } from './api/routes/config.js';
+import { poltergeistRoutes } from './api/routes/poltergeist.js';
+import { GuiAutomationAdapter } from '../infrastructure/gui/GuiAutomationAdapter.js';
+import { LocalTtsAdapter } from '../infrastructure/gui/LocalTtsAdapter.js';
+import { ExecuteGuiActionUseCase } from '../application/ExecuteGuiAction/ExecuteGuiActionUseCase.js';
+import { GetVoicesUseCase } from '../application/GetVoices/GetVoicesUseCase.js';
 
 export async function bootstrap() {
   const config = getConfig();
@@ -79,6 +85,15 @@ export async function bootstrap() {
   registerTerminalWS(app);
   registerMobileWS(app, sessionMgr);
 
+  const ttsAdapter = new LocalTtsAdapter();
+  const guiAdapter = new GuiAutomationAdapter(ttsAdapter, {
+    screenshotMaxWidth: config.SCREENSHOT_MAX_WIDTH,
+    jpegQuality: config.SCREENSHOT_JPEG_QUALITY,
+  });
+  const executeGuiAction = new ExecuteGuiActionUseCase(guiAdapter);
+  const getVoices = new GetVoicesUseCase(ttsAdapter);
+  registerPoltergeistWS(app, executeGuiAction, getVoices);
+
   const allowedDeviceIds = config.ALLOWED_DEVICE_IDS
     .split(',').map((s) => s.trim()).filter(Boolean);
   await authRoutes(app, config.DASHBOARD_PASSWORD, allowedDeviceIds);
@@ -86,6 +101,7 @@ export async function bootstrap() {
   await commandRoutes(app, commandRepo);
   await botRoutes(app, adapters, latestQR);
   await configRoutes(app, modeManager);
+  await poltergeistRoutes(app, getVoices);
 
   await app.listen({ port: config.DASHBOARD_PORT, host: '0.0.0.0' });
   console.log(`\n🚀 JARVIS Dashboard: http://localhost:${config.DASHBOARD_PORT}`);

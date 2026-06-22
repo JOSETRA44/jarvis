@@ -17,6 +17,11 @@ const schema = z.object({
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
   ALLOWED_DEVICE_IDS: z.string().optional().default(''),
   CORS_ORIGINS: z.string().optional().default('http://localhost:3000'),
+  // Poltergeist screenshot tuning (anti-jank: smaller JPEG payload)
+  SCREENSHOT_MAX_WIDTH: z.coerce.number().default(1366),
+  SCREENSHOT_JPEG_QUALITY: z.coerce.number().default(80),
+  // Optional cloud TTS (future ElevenLabsTtsAdapter); empty → local TTS only
+  ELEVENLABS_API_KEY: z.string().optional().default(''),
 });
 
 export type Config = z.infer<typeof schema>;

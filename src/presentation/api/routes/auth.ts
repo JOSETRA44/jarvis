@@ -1,19 +1,36 @@
 import type { FastifyInstance } from 'fastify';
 
-const loginAttempts = new Map<string, { count: number; resetAt: number }>();
-const MAX_ATTEMPTS = 5;
+// Brute-force protection: rate-limit only FAILED logins. Successful logins
+// never count and reset the counter, so a legitimate admin reconnecting (even
+// rapidly, e.g. after backgrounding the app) can never ban themselves — while
+// an attacker (all failures) is still throttled at MAX_FAILURES / WINDOW_MS.
+const loginFailures = new Map<string, { count: number; resetAt: number }>();
+const MAX_FAILURES = 5;
 const WINDOW_MS = 15 * 60 * 1000;
 
-function checkRateLimit(ip: string): boolean {
+/** Returns remaining lockout seconds if the IP is blocked, else 0. */
+function blockedFor(ip: string): number {
   const now = Date.now();
-  const entry = loginAttempts.get(ip);
-  if (!entry || now > entry.resetAt) {
-    loginAttempts.set(ip, { count: 1, resetAt: now + WINDOW_MS });
-    return true;
+  const entry = loginFailures.get(ip);
+  if (!entry || now > entry.resetAt) return 0;
+  if (entry.count >= MAX_FAILURES) {
+    return Math.ceil((entry.resetAt - now) / 1000);
   }
-  if (entry.count >= MAX_ATTEMPTS) return false;
-  entry.count++;
-  return true;
+  return 0;
+}
+
+function recordFailure(ip: string): void {
+  const now = Date.now();
+  const entry = loginFailures.get(ip);
+  if (!entry || now > entry.resetAt) {
+    loginFailures.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+  } else {
+    entry.count++;
+  }
+}
+
+function resetFailures(ip: string): void {
+  loginFailures.delete(ip);
 }
 
 export async function authRoutes(
@@ -27,23 +44,31 @@ export async function authRoutes(
       const ip = req.ip ?? 'unknown';
       const { password, deviceId } = req.body;
 
-      if (!checkRateLimit(ip)) {
-        app.log.warn(`[AUTH] Rate limit exceeded — IP: ${ip}`);
-        return reply.code(429).send({ error: 'Demasiados intentos. Espera 15 minutos.' });
+      const retryAfter = blockedFor(ip);
+      if (retryAfter > 0) {
+        app.log.warn(`[AUTH] Rate limit (failures) — IP: ${ip}, retryAfter: ${retryAfter}s`);
+        reply.header('Retry-After', String(retryAfter));
+        return reply.code(429).send({
+          error: `Demasiados intentos fallidos. Reintenta en ${retryAfter}s.`,
+        });
       }
 
       if (password !== dashboardPassword) {
+        recordFailure(ip);
         app.log.warn(`[AUTH] Wrong password — IP: ${ip}`);
         return reply.code(401).send({ error: 'Contraseña incorrecta' });
       }
 
       if (allowedDeviceIds.length > 0) {
         if (!deviceId || !allowedDeviceIds.includes(deviceId)) {
+          recordFailure(ip);
           app.log.warn(`[AUTH] Unauthorized device — IP: ${ip}, deviceId: ${deviceId ?? 'none'}`);
           return reply.code(401).send({ error: 'Dispositivo no autorizado' });
         }
       }
 
+      // Success — clear any prior failures so legit re-auth is never penalized.
+      resetFailures(ip);
       app.log.info(`[AUTH] Login OK — IP: ${ip}, deviceId: ${deviceId ?? 'none'}`);
       const token = app.jwt.sign(
         { role: 'admin', deviceId: deviceId ?? null },

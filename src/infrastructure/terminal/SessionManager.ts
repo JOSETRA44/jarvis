@@ -15,10 +15,16 @@ export class SessionManager {
   private interactive = new Map<string, PtyProcess>();
   private defaultCwd: string;
 
-  // Mobile app connections: connId → { sessionId → PtyTerminalSession }
+  // Mobile app sessions keyed by deviceId (stable across reconnects) →
+  // { sessionId → PtyTerminalSession }. Falls back to ephemeral connId when no
+  // deviceId is present (ALLOWED_DEVICE_IDS unset) — then there's no persistence.
   private mobileConns = new Map<string, Map<string, PtyTerminalSession>>();
-  // Active session per connection (for fallback routing when session id omitted)
+  // Active session per device (for fallback routing when session id omitted)
   private mobileActive = new Map<string, string>();
+  // Grace-period timers: a detached device's sessions are killed only if it
+  // does not re-attach before DETACH_GRACE_MS elapses.
+  private detachTimers = new Map<string, NodeJS.Timeout>();
+  private static readonly DETACH_GRACE_MS = 180_000;
 
   constructor(defaultCwd: string) {
     this.defaultCwd = defaultCwd;
@@ -107,72 +113,122 @@ export class SessionManager {
     }
     this.mobileConns.clear();
     this.mobileActive.clear();
+
+    for (const timer of this.detachTimers.values()) clearTimeout(timer);
+    this.detachTimers.clear();
   }
 
-  // ── Mobile PTY sessions (per-connection tabs) ─────────────────────
+  // ── Mobile PTY sessions (per-device tabs, persistent across reconnects) ──
 
-  createMobileSession(connId: string, cwd?: string): PtyTerminalSession {
-    let conn = this.mobileConns.get(connId);
+  createMobileSession(deviceId: string, cwd?: string): PtyTerminalSession {
+    this._cancelDetach(deviceId);
+    let conn = this.mobileConns.get(deviceId);
     if (!conn) {
       conn = new Map();
-      this.mobileConns.set(connId, conn);
+      this.mobileConns.set(deviceId, conn);
     }
     const sess = new PtyTerminalSession(cwd ?? this.defaultCwd);
     conn.set(sess.sessionId, sess);
-    this.mobileActive.set(connId, sess.sessionId);
+    this.mobileActive.set(deviceId, sess.sessionId);
 
     sess.on('exit', () => {
       conn!.delete(sess.sessionId);
       // Promote another session if this was the active one
-      if (this.mobileActive.get(connId) === sess.sessionId) {
+      if (this.mobileActive.get(deviceId) === sess.sessionId) {
         const remaining = [...conn!.keys()];
         if (remaining.length > 0) {
-          this.mobileActive.set(connId, remaining[remaining.length - 1]!);
+          this.mobileActive.set(deviceId, remaining[remaining.length - 1]!);
         } else {
-          this.mobileActive.delete(connId);
+          this.mobileActive.delete(deviceId);
         }
       }
     });
     return sess;
   }
 
-  getMobileSession(connId: string, sessionId: string): PtyTerminalSession | undefined {
-    return this.mobileConns.get(connId)?.get(sessionId);
+  getMobileSession(deviceId: string, sessionId: string): PtyTerminalSession | undefined {
+    return this.mobileConns.get(deviceId)?.get(sessionId);
   }
 
-  getActiveMobileSession(connId: string): PtyTerminalSession | undefined {
-    const activeId = this.mobileActive.get(connId);
+  getActiveMobileSession(deviceId: string): PtyTerminalSession | undefined {
+    const activeId = this.mobileActive.get(deviceId);
     if (!activeId) return undefined;
-    return this.mobileConns.get(connId)?.get(activeId);
+    return this.mobileConns.get(deviceId)?.get(activeId);
   }
 
-  setActiveMobileSession(connId: string, sessionId: string): void {
-    this.mobileActive.set(connId, sessionId);
+  setActiveMobileSession(deviceId: string, sessionId: string): void {
+    this.mobileActive.set(deviceId, sessionId);
   }
 
-  closeMobileSession(connId: string, sessionId: string): void {
-    const conn = this.mobileConns.get(connId);
+  closeMobileSession(deviceId: string, sessionId: string): void {
+    const conn = this.mobileConns.get(deviceId);
     if (!conn) return;
     const sess = conn.get(sessionId);
     if (sess) { sess.kill(); conn.delete(sessionId); }
-    if (this.mobileActive.get(connId) === sessionId) {
+    if (this.mobileActive.get(deviceId) === sessionId) {
       const remaining = [...conn.keys()];
       if (remaining.length > 0) {
-        this.mobileActive.set(connId, remaining[remaining.length - 1]!);
+        this.mobileActive.set(deviceId, remaining[remaining.length - 1]!);
       } else {
-        this.mobileActive.delete(connId);
+        this.mobileActive.delete(deviceId);
       }
     }
   }
 
-  closeAllMobileSessions(connId: string): void {
-    const conn = this.mobileConns.get(connId);
+  closeAllMobileSessions(deviceId: string): void {
+    this._cancelDetach(deviceId);
+    const conn = this.mobileConns.get(deviceId);
     if (conn) {
       for (const sess of conn.values()) try { sess.kill(); } catch { /* ignore */ }
       conn.clear();
     }
-    this.mobileConns.delete(connId);
-    this.mobileActive.delete(connId);
+    this.mobileConns.delete(deviceId);
+    this.mobileActive.delete(deviceId);
+  }
+
+  // ── Detach / re-attach (background-drop resilience) ──────────────────
+
+  /** True if the device has at least one live session to re-attach to. */
+  hasLiveSessions(deviceId: string): boolean {
+    const conn = this.mobileConns.get(deviceId);
+    return !!conn && conn.size > 0;
+  }
+
+  /** All live sessions for a device, in insertion order. */
+  listMobileSessions(deviceId: string): PtyTerminalSession[] {
+    const conn = this.mobileConns.get(deviceId);
+    return conn ? [...conn.values()] : [];
+  }
+
+  /**
+   * Mark a device as detached (its WebSocket dropped). Sessions are kept alive
+   * for DETACH_GRACE_MS so a quick reconnect re-attaches them; if the grace
+   * expires without re-attach, they're killed.
+   */
+  detachDevice(deviceId: string): void {
+    if (!this.hasLiveSessions(deviceId)) return;
+    this._cancelDetach(deviceId);
+    const timer = setTimeout(() => {
+      this.detachTimers.delete(deviceId);
+      this.closeAllMobileSessions(deviceId);
+    }, SessionManager.DETACH_GRACE_MS);
+    // Don't keep the event loop alive solely for this timer.
+    if (typeof timer.unref === 'function') timer.unref();
+    this.detachTimers.set(deviceId, timer);
+  }
+
+  /** Cancel a pending detach grace timer (device re-attached). */
+  reattachDevice(deviceId: string): PtyTerminalSession[] {
+    this._cancelDetach(deviceId);
+    return this.listMobileSessions(deviceId);
+  }
+
+  private _cancelDetach(deviceId: string): void {
+    const timer = this.detachTimers.get(deviceId);
+    if (timer) {
+      clearTimeout(timer);
+      this.detachTimers.delete(deviceId);
+    }
   }
 
   getActiveSessions(): Array<{ operatorId: string; cwd: string; interactive: boolean }> {

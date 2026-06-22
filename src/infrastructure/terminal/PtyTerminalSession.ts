@@ -43,6 +43,10 @@ export class PtyTerminalSession extends EventEmitter {
   private _buf = '';
   private _ready = false;      // true after first OSC 9001 fires
   private _alive = true;
+  // Ring buffer of recent raw output (for replay when a device re-attaches
+  // after a background WebSocket drop). Capped to avoid unbounded memory.
+  private _rawBuffer = '';
+  private static readonly MAX_BUFFER = 64 * 1024;
   // True when the previous output chunk ended with a bare \r (no \n).
   // This means the next output should replace the last line in the Flutter UI
   // instead of appending — handles spinner/progress-bar overwrites.
@@ -114,6 +118,12 @@ export class PtyTerminalSession extends EventEmitter {
     const rawForClient = chunk.replace(MARKER_RE, '');
     if (rawForClient) {
       this.emit('raw_output', rawForClient);
+      this._rawBuffer += rawForClient;
+      if (this._rawBuffer.length > PtyTerminalSession.MAX_BUFFER) {
+        this._rawBuffer = this._rawBuffer.slice(
+          this._rawBuffer.length - PtyTerminalSession.MAX_BUFFER,
+        );
+      }
     }
 
     // ── Screen-clear detection (must run on raw chunk before ANSI strip) ──────
@@ -162,6 +172,9 @@ export class PtyTerminalSession extends EventEmitter {
 
   get cwd(): string { return this._cwd; }
   get alive(): boolean { return this._alive; }
+
+  /** Accumulated recent raw output, for replay on device re-attach. */
+  get rawBuffer(): string { return this._rawBuffer; }
 
   /** Send raw bytes to the PTY stdin (keystroke, command + \r, control seq). */
   write(data: string): void {
